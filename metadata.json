@@ -1,0 +1,6 @@
+{
+  "name": "SmartAttend",
+  "description": "Multi-tenant Employee Attendance, Geofencing, and Leave Management Platform with global username and auto-generated Employee ID authentication.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,13 @@
+node_modules/
+build/
+dist/
+coverage/
+.idea/
+.DS_Store
+*.log
+.env*
+!.env.example
+smartattend.db
+smartattend.db-shm
+smartattend.db-wal
+public/assets/aistudio/local_*.properties
