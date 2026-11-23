@@ -14,6 +14,7 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "test": "tsx tests/verify_smartattend.ts",
+    "test:unit": "tsx tests/schedule_logic_test.ts",
     "migrate:sqlite": "tsx scripts/migrate-sqlite-to-postgres.ts"
   },
   "dependencies": {

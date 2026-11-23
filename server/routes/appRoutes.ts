@@ -18,6 +18,19 @@ import {
   validateUsernameFormat,
   type AuthenticatedRequest,
 } from '../auth.ts';
+import {
+  addDays,
+  evaluateBreakCompliance,
+  evaluateOverallBreakCompliance,
+  formatLocalDate,
+  isValidDate,
+  isValidTime,
+  parseTimeToMinutes,
+  resolveAttendanceShift,
+  resolveBreakConfig,
+  resolveShiftAssignment,
+  type BreakConfigRow,
+} from '../schedule.ts';
 
 const ADMIN_ROLES = ['Company Admin', 'HR'];
 const APPROVER_ROLES = ['Company Admin', 'HR', 'HOD', 'Manager', 'Responsible Person'];
@@ -68,6 +81,224 @@ export function createAppRouter(db: ServerDatabase): Router {
       return true;
     }
     return false;
+  }
+
+  function validateScopeTarget(
+    companyId: string,
+    scopeType: unknown,
+    scopeId: unknown
+  ): { ok: true; scopeId: string | null } | { ok: false; error: string } {
+    const type = String(scopeType || '');
+    if (!['company', 'department', 'employee'].includes(type)) {
+      return { ok: false, error: 'Scope type must be company, department, or employee.' };
+    }
+    if (type === 'company') {
+      return { ok: true, scopeId: null };
+    }
+    if (!scopeId) {
+      return { ok: false, error: `${type} scope requires a target.` };
+    }
+    const table = type === 'department' ? 'departments' : 'employees';
+    const idColumn = type === 'department' ? 'department_id' : 'employee_record_id';
+    const row = db
+      .prepare(`SELECT company_id FROM ${table} WHERE ${idColumn} = ?`)
+      .get(String(scopeId)) as { company_id: string } | undefined;
+    if (!row || row.company_id !== companyId) {
+      return { ok: false, error: `Invalid ${type} for your company.` };
+    }
+    return { ok: true, scopeId: String(scopeId) };
+  }
+
+  function hasAssignmentOverlap(
+    companyId: string,
+    scopeType: string,
+    scopeId: string | null,
+    startDate: string,
+    endDate: string,
+    excludeAssignmentId = ''
+  ): boolean {
+    const params: unknown[] = [companyId, scopeType, endDate, startDate, excludeAssignmentId];
+    let scopeClause = 'scope_id IS NULL';
+    if (scopeType !== 'company') {
+      scopeClause = 'scope_id = ?';
+      params.push(scopeId);
+    }
+    return Boolean(
+      db
+        .prepare(`
+          SELECT assignment_id FROM shift_assignments
+          WHERE company_id = ? AND scope_type = ?
+            AND start_date <= ? AND end_date >= ?
+            AND assignment_id != ? AND ${scopeClause}
+          LIMIT 1
+        `)
+        .get(...params)
+    );
+  }
+
+  function insertShiftAssignment(
+    companyId: string,
+    scopeType: string,
+    scopeId: string | null,
+    shiftId: string,
+    startDate: string,
+    endDate: string
+  ): string {
+    const assignmentId = generateId('sa');
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO shift_assignments (
+        assignment_id, company_id, scope_type, scope_id, shift_id, start_date, end_date, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(assignmentId, companyId, scopeType, scopeId, shiftId, startDate, endDate, now, now);
+    return assignmentId;
+  }
+
+  function hasActiveBreakConfig(
+    companyId: string,
+    scopeType: string,
+    scopeId: string | null,
+    excludeConfigId = ''
+  ): string | null {
+    const params: unknown[] = [companyId, scopeType, excludeConfigId];
+    let scopeClause = 'scope_id IS NULL';
+    if (scopeType !== 'company') {
+      scopeClause = 'scope_id = ?';
+      params.push(scopeId);
+    }
+    const row = db
+      .prepare(`
+        SELECT config_id FROM lunch_break_configs
+        WHERE company_id = ? AND scope_type = ? AND is_active = 1
+          AND config_id != ? AND ${scopeClause}
+        LIMIT 1
+      `)
+      .get(...params) as { config_id: string } | undefined;
+    return row?.config_id ?? null;
+  }
+
+  function validateShiftInput(body: Record<string, unknown>): {
+    ok: true;
+    values: {
+      name: string;
+      startTime: string;
+      endTime: string;
+      graceMinutes: number;
+      breakMinutes: number;
+      workingHours: number;
+    };
+  } | { ok: false; error: string } {
+    const name = String(body.name || '').trim();
+    const startTime = String(body.startTime || '');
+    const endTime = String(body.endTime || '');
+    if (!name) return { ok: false, error: 'Shift name is required.' };
+    if (!isValidTime(startTime) || !isValidTime(endTime)) {
+      return { ok: false, error: 'Shift start and end times must use HH:MM.' };
+    }
+    const graceMinutes = Number(body.graceMinutes ?? 15);
+    const breakMinutes = Number(body.breakMinutes ?? 60);
+    const workingHours = Number(body.workingHours ?? 8);
+    if (!Number.isInteger(graceMinutes) || graceMinutes < 0 || graceMinutes > 240) {
+      return { ok: false, error: 'Grace minutes must be between 0 and 240.' };
+    }
+    if (!Number.isInteger(breakMinutes) || breakMinutes < 0 || breakMinutes > 480) {
+      return { ok: false, error: 'Break minutes must be between 0 and 480.' };
+    }
+    if (!Number.isFinite(workingHours) || workingHours <= 0 || workingHours > 24) {
+      return { ok: false, error: 'Working hours must be greater than 0 and at most 24.' };
+    }
+    return {
+      ok: true,
+      values: { name, startTime, endTime, graceMinutes, breakMinutes, workingHours },
+    };
+  }
+
+  function validateBreakConfigInput(body: Record<string, unknown>): {
+    ok: true;
+    values: {
+      breakType: string;
+      durationMinutes: number;
+      windowStart: string | null;
+      windowEnd: string | null;
+      maxDurationMinutes: number | null;
+      isActive: number;
+    };
+  } | { ok: false; error: string } {
+    const breakType = String(body.breakType || '');
+    if (!['mandatory', 'optional', 'flexible'].includes(breakType)) {
+      return { ok: false, error: 'Break type must be mandatory, optional, or flexible.' };
+    }
+    const durationMinutes = Number(body.durationMinutes ?? 60);
+    if (!Number.isInteger(durationMinutes) || durationMinutes < 1 || durationMinutes > 480) {
+      return { ok: false, error: 'Break duration must be between 1 and 480 minutes.' };
+    }
+    const windowStart = body.windowStart ? String(body.windowStart) : null;
+    const windowEnd = body.windowEnd ? String(body.windowEnd) : null;
+    if ((windowStart && !windowEnd) || (!windowStart && windowEnd)) {
+      return { ok: false, error: 'Provide both break window start and end, or leave both empty.' };
+    }
+    if (windowStart && !isValidTime(windowStart)) {
+      return { ok: false, error: 'Break window start must use HH:MM.' };
+    }
+    if (windowEnd && !isValidTime(windowEnd)) {
+      return { ok: false, error: 'Break window end must use HH:MM.' };
+    }
+    const maxDurationMinutes = body.maxDurationMinutes ? Number(body.maxDurationMinutes) : null;
+    if (maxDurationMinutes !== null && (!Number.isInteger(maxDurationMinutes) || maxDurationMinutes < durationMinutes)) {
+      return { ok: false, error: 'Maximum break duration must be at least the configured break duration.' };
+    }
+    return {
+      ok: true,
+      values: {
+        breakType,
+        durationMinutes,
+        windowStart,
+        windowEnd,
+        maxDurationMinutes,
+        isActive: body.isActive === false ? 0 : 1,
+      },
+    };
+  }
+
+  function recordBreakEvent(
+    companyId: string,
+    employeeRecordId: string,
+    attendanceId: string,
+    config: BreakConfigRow | null,
+    breakStart: string,
+    breakEnd: string,
+    durationMinutes: number
+  ): string {
+    const compliance = evaluateBreakCompliance(config, durationMinutes, breakStart, breakEnd);
+    db.prepare(`
+      INSERT INTO attendance_breaks (
+        break_id, company_id, attendance_id, employee_record_id, break_type,
+        break_start, break_end, duration_minutes, compliance, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      generateId('brk'),
+      companyId,
+      attendanceId,
+      employeeRecordId,
+      config?.break_type ?? 'unconfigured',
+      breakStart,
+      breakEnd,
+      durationMinutes,
+      compliance,
+      new Date().toISOString()
+    );
+    return compliance;
+  }
+
+  function breakEventsFor(companyId: string, attendanceId: string) {
+    return db
+      .prepare(`
+        SELECT break_id, break_type, break_start, break_end, duration_minutes, compliance
+        FROM attendance_breaks
+        WHERE company_id = ? AND attendance_id = ?
+        ORDER BY break_start ASC
+      `)
+      .all(companyId, attendanceId);
   }
 
   // ---------------------------------------------------------------------------
@@ -203,11 +434,47 @@ export function createAppRouter(db: ServerDatabase): Router {
     const companyId = assertCompanyContext(req, res);
     if (!companyId) return;
 
+    const isAdmin = ADMIN_ROLES.includes(req.auth!.role);
     const departments = db.prepare('SELECT * FROM departments WHERE company_id = ? ORDER BY name').all(companyId);
     const locations = db.prepare('SELECT * FROM office_locations WHERE company_id = ? ORDER BY name').all(companyId);
-    const shifts = db.prepare('SELECT * FROM shifts WHERE company_id = ? ORDER BY name').all(companyId);
+    const allShifts = db.prepare('SELECT * FROM shifts WHERE company_id = ? ORDER BY name').all(companyId);
     const holidays = db.prepare('SELECT * FROM holidays WHERE company_id = ? ORDER BY holiday_date').all(companyId);
     const settings = db.prepare('SELECT * FROM company_settings WHERE company_id = ?').get(companyId);
+    const effective = req.auth!.employeeRecordId
+      ? resolveAttendanceShift(db, companyId, req.auth!.employeeRecordId, new Date())
+      : null;
+    const myBreakConfig = effective && effective.shift
+      ? resolveBreakConfig(db, companyId, String(req.auth!.employeeRecordId), effective.attendanceDate)
+      : null;
+    const shifts = isAdmin
+      ? allShifts
+      : effective && effective.shift && effective.source !== 'company_default'
+        ? [effective.shift]
+        : [];
+    const allShiftAssignments = db
+      .prepare(`
+        SELECT sa.*, s.name AS shift_name, s.start_time, s.end_time, s.working_hours,
+               d.name AS department_name, e.employee_name
+        FROM shift_assignments sa
+        JOIN shifts s ON s.shift_id = sa.shift_id AND s.company_id = sa.company_id
+        LEFT JOIN departments d ON sa.scope_type = 'department' AND d.department_id = sa.scope_id AND d.company_id = sa.company_id
+        LEFT JOIN employees e ON sa.scope_type = 'employee' AND e.employee_record_id = sa.scope_id AND e.company_id = sa.company_id
+        WHERE sa.company_id = ?
+        ORDER BY sa.start_date DESC
+      `)
+      .all(companyId);
+    const allLunchBreakConfigs = db
+      .prepare(`
+        SELECT lc.*, d.name AS department_name, e.employee_name
+        FROM lunch_break_configs lc
+        LEFT JOIN departments d ON lc.scope_type = 'department' AND d.department_id = lc.scope_id AND d.company_id = lc.company_id
+        LEFT JOIN employees e ON lc.scope_type = 'employee' AND e.employee_record_id = lc.scope_id AND e.company_id = lc.company_id
+        WHERE lc.company_id = ?
+        ORDER BY lc.updated_at DESC
+      `)
+      .all(companyId);
+    const shiftAssignments = isAdmin ? allShiftAssignments : effective?.assignment ? [effective.assignment] : [];
+    const lunchBreakConfigs = isAdmin ? allLunchBreakConfigs : myBreakConfig ? [myBreakConfig] : [];
     const managers = db
       .prepare(`
         SELECT e.employee_record_id, e.employee_id, e.employee_name, r.role_name
@@ -219,8 +486,30 @@ export function createAppRouter(db: ServerDatabase): Router {
         ORDER BY e.employee_name
       `)
       .all(companyId);
+    const assignableEmployees = db
+      .prepare(`
+        SELECT e.employee_record_id, e.employee_id, e.employee_name, r.role_name
+        FROM employees e
+        JOIN users u ON u.user_id = e.user_id
+        LEFT JOIN roles r ON r.role_id = u.role_id
+        WHERE e.company_id = ? AND e.employment_status = 'active' AND u.account_status = 'active'
+        ORDER BY e.employee_name
+      `)
+      .all(companyId);
 
-    res.json({ departments, locations, shifts, holidays, settings, managers });
+    res.json({
+      departments,
+      locations,
+      shifts,
+      holidays,
+      settings,
+      managers: isAdmin ? managers : [],
+      employees: isAdmin ? assignableEmployees : [],
+      shiftAssignments,
+      lunchBreakConfigs,
+      effectiveShift: effective?.shift ?? null,
+      myBreakConfig,
+    });
   });
 
   router.post('/locations', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
@@ -242,17 +531,87 @@ export function createAppRouter(db: ServerDatabase): Router {
   router.post('/shifts', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
     const companyId = assertCompanyContext(req, res);
     if (!companyId) return;
-    const { name, startTime, endTime, graceMinutes, breakMinutes } = req.body || {};
-    if (!name || !startTime || !endTime) {
-      res.status(400).json({ error: 'Shift name, start time, and end time are required.' });
+    const validation = validateShiftInput(req.body || {});
+    if (!validation.ok) {
+      res.status(400).json({ error: validation.error });
       return;
     }
     const id = generateId('shift');
+    const values = validation.values;
     db.prepare(`
-      INSERT INTO shifts (shift_id, company_id, name, start_time, end_time, grace_minutes, break_minutes)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(id, companyId, String(name).trim(), String(startTime), String(endTime), Number(graceMinutes ?? 15), Number(breakMinutes ?? 60));
+      INSERT INTO shifts (shift_id, company_id, name, start_time, end_time, grace_minutes, break_minutes, working_hours)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      companyId,
+      values.name,
+      values.startTime,
+      values.endTime,
+      values.graceMinutes,
+      values.breakMinutes,
+      values.workingHours
+    );
     res.status(201).json({ shiftId: id });
+  });
+
+  router.patch('/shifts/:shiftId', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
+    const companyId = assertCompanyContext(req, res);
+    if (!companyId) return;
+    const existing = db
+      .prepare('SELECT shift_id FROM shifts WHERE shift_id = ? AND company_id = ?')
+      .get(req.params.shiftId, companyId);
+    if (!existing) {
+      res.status(404).json({ error: 'Shift not found.' });
+      return;
+    }
+    const current = db
+      .prepare('SELECT name, start_time, end_time, grace_minutes, break_minutes, working_hours FROM shifts WHERE shift_id = ? AND company_id = ?')
+      .get(req.params.shiftId, companyId) as Record<string, unknown>;
+    const validation = validateShiftInput({
+      name: req.body?.name ?? current.name,
+      startTime: req.body?.startTime ?? current.start_time,
+      endTime: req.body?.endTime ?? current.end_time,
+      graceMinutes: req.body?.graceMinutes ?? current.grace_minutes,
+      breakMinutes: req.body?.breakMinutes ?? current.break_minutes,
+      workingHours: req.body?.workingHours ?? current.working_hours,
+    });
+    if (!validation.ok) {
+      res.status(400).json({ error: validation.error });
+      return;
+    }
+    const values = validation.values;
+    db.prepare(`
+      UPDATE shifts
+      SET name = ?, start_time = ?, end_time = ?, grace_minutes = ?, break_minutes = ?, working_hours = ?
+      WHERE shift_id = ? AND company_id = ?
+    `).run(
+      values.name,
+      values.startTime,
+      values.endTime,
+      values.graceMinutes,
+      values.breakMinutes,
+      values.workingHours,
+      req.params.shiftId,
+      companyId
+    );
+    res.json({ ok: true });
+  });
+
+  router.delete('/shifts/:shiftId', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
+    const companyId = assertCompanyContext(req, res);
+    if (!companyId) return;
+    const inUse = db
+      .prepare('SELECT assignment_id FROM shift_assignments WHERE shift_id = ? AND company_id = ? LIMIT 1')
+      .get(req.params.shiftId, companyId);
+    if (inUse) {
+      res.status(409).json({
+        error: 'This shift is used by a scheduled assignment. Remove or reschedule those assignments first.',
+        code: 'SHIFT_IN_USE',
+      });
+      return;
+    }
+    db.prepare('DELETE FROM shifts WHERE shift_id = ? AND company_id = ?').run(req.params.shiftId, companyId);
+    res.json({ ok: true });
   });
 
   router.post('/departments', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
@@ -320,6 +679,374 @@ export function createAppRouter(db: ServerDatabase): Router {
     res.json({ ok: true });
   });
 
+  router.get('/shift-assignments', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
+    const companyId = assertCompanyContext(req, res);
+    if (!companyId) return;
+    const rows = db
+      .prepare(`
+        SELECT sa.*, s.name AS shift_name, s.start_time, s.end_time,
+               d.name AS department_name, e.employee_name
+        FROM shift_assignments sa
+        JOIN shifts s ON s.shift_id = sa.shift_id AND s.company_id = sa.company_id
+        LEFT JOIN departments d ON sa.scope_type = 'department' AND d.department_id = sa.scope_id AND d.company_id = sa.company_id
+        LEFT JOIN employees e ON sa.scope_type = 'employee' AND e.employee_record_id = sa.scope_id AND e.company_id = sa.company_id
+        WHERE sa.company_id = ?
+        ORDER BY
+          CASE sa.scope_type WHEN 'employee' THEN 3 WHEN 'department' THEN 2 ELSE 1 END DESC,
+          sa.start_date DESC
+      `)
+      .all(companyId);
+    res.json({ assignments: rows });
+  });
+
+  router.post('/shift-assignments', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
+    const companyId = assertCompanyContext(req, res);
+    if (!companyId) return;
+    const { scopeType, scopeId, shiftId, startDate, endDate } = req.body || {};
+    const scope = validateScopeTarget(companyId, scopeType, scopeId);
+    if (!scope.ok) {
+      res.status(400).json({ error: scope.error });
+      return;
+    }
+    const shift = db
+      .prepare('SELECT shift_id FROM shifts WHERE shift_id = ? AND company_id = ?')
+      .get(String(shiftId || ''), companyId);
+    if (!shift) {
+      res.status(400).json({ error: 'Invalid shift for your company.' });
+      return;
+    }
+    if (!isValidDate(startDate) || !isValidDate(endDate) || String(startDate) > String(endDate)) {
+      res.status(400).json({ error: 'Provide a valid start date and an end date on or after the start date.' });
+      return;
+    }
+    if (hasAssignmentOverlap(companyId, String(scopeType), scope.scopeId, String(startDate), String(endDate))) {
+      res.status(409).json({
+        error: 'An overlapping shift assignment already exists for this scope.',
+        code: 'SHIFT_ASSIGNMENT_OVERLAP',
+      });
+      return;
+    }
+    const assignmentId = generateId('sa');
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO shift_assignments (
+        assignment_id, company_id, scope_type, scope_id, shift_id, start_date, end_date, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(assignmentId, companyId, String(scopeType), scope.scopeId, String(shiftId), String(startDate), String(endDate), now, now);
+    res.status(201).json({ assignmentId });
+  });
+
+  router.patch('/shift-assignments/:assignmentId', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
+    const companyId = assertCompanyContext(req, res);
+    if (!companyId) return;
+    const existing = db
+      .prepare('SELECT * FROM shift_assignments WHERE assignment_id = ? AND company_id = ?')
+      .get(req.params.assignmentId, companyId) as Record<string, unknown> | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Shift assignment not found.' });
+      return;
+    }
+    const today = formatLocalDate(new Date());
+    const cutoff = req.body?.effectiveDate ? String(req.body.effectiveDate) : today;
+    if (!isValidDate(cutoff) || cutoff < today) {
+      res.status(400).json({ error: 'effectiveDate must be today or a future date.' });
+      return;
+    }
+    const oldStart = String(existing.start_date);
+    const oldEnd = String(existing.end_date);
+    if (oldEnd < cutoff) {
+      res.status(409).json({
+        error: 'Historical shift assignments cannot be modified.',
+        code: 'SCHEDULE_HISTORY_IMMUTABLE',
+      });
+      return;
+    }
+    const nextScopeType = req.body?.scopeType ?? existing.scope_type;
+    const nextScopeId = req.body?.scopeId ?? existing.scope_id;
+    const scope = validateScopeTarget(companyId, nextScopeType, nextScopeId);
+    if (!scope.ok) {
+      res.status(400).json({ error: scope.error });
+      return;
+    }
+    const nextShiftId = String(req.body?.shiftId ?? existing.shift_id);
+    const shift = db.prepare('SELECT shift_id FROM shifts WHERE shift_id = ? AND company_id = ?').get(nextShiftId, companyId);
+    if (!shift) {
+      res.status(400).json({ error: 'Invalid shift for your company.' });
+      return;
+    }
+    const startDate = String(req.body?.startDate ?? oldStart);
+    const endDate = String(req.body?.endDate ?? oldEnd);
+    if (!isValidDate(startDate) || !isValidDate(endDate) || startDate > endDate) {
+      res.status(400).json({ error: 'Provide a valid start date and an end date on or after the start date.' });
+      return;
+    }
+    if (endDate < cutoff || (oldStart >= cutoff && startDate < cutoff)) {
+      res.status(409).json({
+        error: 'Historical shift assignments cannot be modified.',
+        code: 'SCHEDULE_HISTORY_IMMUTABLE',
+      });
+      return;
+    }
+    const scopeType = String(nextScopeType);
+    const assignmentId = String(existing.assignment_id);
+    const now = new Date().toISOString();
+    const overlapError = () => ({
+      error: 'An overlapping shift assignment already exists for this scope.',
+      code: 'SHIFT_ASSIGNMENT_OVERLAP',
+    });
+
+    if (oldStart >= cutoff) {
+      if (hasAssignmentOverlap(companyId, scopeType, scope.scopeId, startDate, endDate, assignmentId)) {
+        res.status(409).json(overlapError());
+        return;
+      }
+      db.prepare(`
+        UPDATE shift_assignments
+        SET scope_type = ?, scope_id = ?, shift_id = ?, start_date = ?, end_date = ?, updated_at = ?
+        WHERE assignment_id = ? AND company_id = ?
+      `).run(scopeType, scope.scopeId, nextShiftId, startDate, endDate, now, assignmentId, companyId);
+      res.json({ ok: true, split: false });
+      return;
+    }
+
+    const futureStart = startDate > cutoff ? startDate : cutoff;
+    const oldScopeType = String(existing.scope_type);
+    const oldScopeId = oldScopeType === 'company'
+      ? null
+      : existing.scope_id === null || existing.scope_id === undefined
+        ? null
+        : String(existing.scope_id);
+
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      db.prepare(`
+        UPDATE shift_assignments SET end_date = ?, updated_at = ?
+        WHERE assignment_id = ? AND company_id = ?
+      `).run(addDays(cutoff, -1), now, assignmentId, companyId);
+      const createdIds: string[] = [];
+
+      if (futureStart > cutoff) {
+        const bridgeEnd = addDays(futureStart, -1);
+        if (hasAssignmentOverlap(companyId, oldScopeType, oldScopeId, cutoff, bridgeEnd, assignmentId)) {
+          throw new Error('OVERLAP');
+        }
+        createdIds.push(insertShiftAssignment(
+          companyId,
+          oldScopeType,
+          oldScopeId,
+          String(existing.shift_id),
+          cutoff,
+          bridgeEnd
+        ));
+      }
+
+      if (hasAssignmentOverlap(companyId, scopeType, scope.scopeId, futureStart, endDate, assignmentId)) {
+        throw new Error('OVERLAP');
+      }
+      createdIds.push(insertShiftAssignment(companyId, scopeType, scope.scopeId, nextShiftId, futureStart, endDate));
+      db.exec('COMMIT;');
+      res.json({ ok: true, split: true, assignmentIds: createdIds });
+    } catch (err) {
+      db.exec('ROLLBACK;');
+      if (err instanceof Error && err.message === 'OVERLAP') {
+        res.status(409).json(overlapError());
+        return;
+      }
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Schedule update failed.' });
+    }
+  });
+
+  router.delete('/shift-assignments/:assignmentId', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
+    const companyId = assertCompanyContext(req, res);
+    if (!companyId) return;
+    const existing = db
+      .prepare('SELECT start_date, end_date FROM shift_assignments WHERE assignment_id = ? AND company_id = ?')
+      .get(req.params.assignmentId, companyId) as { start_date: string; end_date: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Shift assignment not found.' });
+      return;
+    }
+    const today = formatLocalDate(new Date());
+    const cutoff = req.query.effectiveDate ? String(req.query.effectiveDate) : today;
+    if (!isValidDate(cutoff) || cutoff < today) {
+      res.status(400).json({ error: 'effectiveDate must be today or a future date.' });
+      return;
+    }
+    if (existing.end_date < cutoff) {
+      res.status(409).json({
+        error: 'Historical shift assignments cannot be deleted.',
+        code: 'SCHEDULE_HISTORY_IMMUTABLE',
+      });
+      return;
+    }
+    if (existing.start_date < cutoff) {
+      db.prepare(`
+        UPDATE shift_assignments SET end_date = ?, updated_at = ?
+        WHERE assignment_id = ? AND company_id = ?
+      `).run(addDays(cutoff, -1), new Date().toISOString(), req.params.assignmentId, companyId);
+      res.json({ ok: true, trimmed: true });
+      return;
+    }
+    db.prepare('DELETE FROM shift_assignments WHERE assignment_id = ? AND company_id = ?').run(
+      req.params.assignmentId,
+      companyId
+    );
+    res.json({ ok: true, trimmed: false });
+  });
+
+  router.get('/shifts/effective', (req: AuthenticatedRequest, res) => {
+    const companyId = assertCompanyContext(req, res);
+    if (!companyId) return;
+    const employeeRecordId = String(req.query.employeeRecordId || req.auth!.employeeRecordId || '');
+    if (!employeeRecordId) {
+      res.status(400).json({ error: 'An employee record is required.' });
+      return;
+    }
+    if (employeeRecordId !== req.auth!.employeeRecordId && !ADMIN_ROLES.includes(req.auth!.role)) {
+      res.status(403).json({ error: 'You can only preview your own effective shift.' });
+      return;
+    }
+    const date = String(req.query.date || formatLocalDate(new Date()));
+    if (!isValidDate(date)) {
+      res.status(400).json({ error: 'Date must use YYYY-MM-DD.' });
+      return;
+    }
+    const resolved = resolveShiftAssignment(db, companyId, employeeRecordId, date);
+    const isAdmin = ADMIN_ROLES.includes(req.auth!.role);
+    const visible = isAdmin || resolved.source !== 'company_default';
+    res.json({
+      date,
+      source: visible ? resolved.source : 'none',
+      shift: visible ? resolved.shift : null,
+      assignment: visible ? resolved.assignment : null,
+    });
+  });
+
+  router.get('/lunch-break-configs', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
+    const companyId = assertCompanyContext(req, res);
+    if (!companyId) return;
+    const configs = db
+      .prepare(`
+        SELECT lc.*, d.name AS department_name, e.employee_name
+        FROM lunch_break_configs lc
+        LEFT JOIN departments d ON lc.scope_type = 'department' AND d.department_id = lc.scope_id AND d.company_id = lc.company_id
+        LEFT JOIN employees e ON lc.scope_type = 'employee' AND e.employee_record_id = lc.scope_id AND e.company_id = lc.company_id
+        WHERE lc.company_id = ?
+        ORDER BY lc.updated_at DESC
+      `)
+      .all(companyId);
+    res.json({ configs });
+  });
+
+  router.post('/lunch-break-configs', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
+    const companyId = assertCompanyContext(req, res);
+    if (!companyId) return;
+    const scope = validateScopeTarget(companyId, req.body?.scopeType, req.body?.scopeId);
+    if (!scope.ok) {
+      res.status(400).json({ error: scope.error });
+      return;
+    }
+    const validation = validateBreakConfigInput(req.body || {});
+    if (!validation.ok) {
+      res.status(400).json({ error: validation.error });
+      return;
+    }
+    if (hasActiveBreakConfig(companyId, String(req.body.scopeType), scope.scopeId)) {
+      res.status(409).json({
+        error: 'An active break configuration already exists for this scope.',
+        code: 'BREAK_CONFIG_EXISTS',
+      });
+      return;
+    }
+    const configId = generateId('lbc');
+    const now = new Date().toISOString();
+    const values = validation.values;
+    db.prepare(`
+      INSERT INTO lunch_break_configs (
+        config_id, company_id, scope_type, scope_id, break_type, duration_minutes,
+        window_start, window_end, max_duration_minutes, is_active, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      configId,
+      companyId,
+      String(req.body.scopeType),
+      scope.scopeId,
+      values.breakType,
+      values.durationMinutes,
+      values.windowStart,
+      values.windowEnd,
+      values.maxDurationMinutes,
+      values.isActive,
+      now,
+      now
+    );
+    res.status(201).json({ configId });
+  });
+
+  router.patch('/lunch-break-configs/:configId', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
+    const companyId = assertCompanyContext(req, res);
+    if (!companyId) return;
+    const existing = db
+      .prepare('SELECT * FROM lunch_break_configs WHERE config_id = ? AND company_id = ?')
+      .get(req.params.configId, companyId) as Record<string, unknown> | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Lunch break configuration not found.' });
+      return;
+    }
+    const scope = validateScopeTarget(
+      companyId,
+      req.body?.scopeType ?? existing.scope_type,
+      req.body?.scopeId ?? existing.scope_id
+    );
+    if (!scope.ok) {
+      res.status(400).json({ error: scope.error });
+      return;
+    }
+    const validation = validateBreakConfigInput({
+      breakType: req.body?.breakType ?? existing.break_type,
+      durationMinutes: req.body?.durationMinutes ?? existing.duration_minutes,
+      windowStart: req.body?.windowStart ?? existing.window_start,
+      windowEnd: req.body?.windowEnd ?? existing.window_end,
+      maxDurationMinutes: req.body?.maxDurationMinutes ?? existing.max_duration_minutes,
+      isActive: req.body?.isActive ?? existing.is_active,
+    });
+    if (!validation.ok) {
+      res.status(400).json({ error: validation.error });
+      return;
+    }
+    const values = validation.values;
+    const nextScopeType = String(req.body?.scopeType ?? existing.scope_type);
+    if (
+      values.isActive
+      && hasActiveBreakConfig(companyId, nextScopeType, scope.scopeId, String(existing.config_id))
+    ) {
+      res.status(409).json({
+        error: 'An active break configuration already exists for this scope.',
+        code: 'BREAK_CONFIG_EXISTS',
+      });
+      return;
+    }
+    db.prepare(`
+      UPDATE lunch_break_configs
+      SET scope_type = ?, scope_id = ?, break_type = ?, duration_minutes = ?,
+          window_start = ?, window_end = ?, max_duration_minutes = ?, is_active = ?, updated_at = ?
+      WHERE config_id = ? AND company_id = ?
+    `).run(
+      nextScopeType,
+      scope.scopeId,
+      values.breakType,
+      values.durationMinutes,
+      values.windowStart,
+      values.windowEnd,
+      values.maxDurationMinutes,
+      values.isActive,
+      new Date().toISOString(),
+      existing.config_id,
+      companyId
+    );
+    res.json({ ok: true });
+  });
+
   // ---------------------------------------------------------------------------
   // 3. EMPLOYEE MANAGEMENT (Admin/HR creates accounts; never exposes passwords)
   // ---------------------------------------------------------------------------
@@ -332,7 +1059,7 @@ export function createAppRouter(db: ServerDatabase): Router {
       .prepare(`
         SELECT
           e.employee_record_id, e.employee_id, e.user_id, e.company_id,
-          e.employee_name, e.email, e.mobile, e.department_id, e.designation,
+          e.employee_name, e.email, e.mobile, e.address, e.department_id, e.designation,
           e.reporting_manager_id, e.hod_id, e.joining_date, e.employment_type,
           e.office_location_id, e.assigned_shift_id, e.employment_status, e.profile_picture, e.created_at,
           u.username, u.account_status, u.must_change_password,
@@ -363,7 +1090,7 @@ export function createAppRouter(db: ServerDatabase): Router {
       .prepare(`
         SELECT
           e.employee_record_id, e.employee_id, e.user_id, e.company_id,
-          e.employee_name, e.email, e.mobile, e.department_id, e.designation,
+          e.employee_name, e.email, e.mobile, e.address, e.department_id, e.designation,
           e.reporting_manager_id, e.hod_id, e.joining_date, e.employment_type,
           e.office_location_id, e.assigned_shift_id, e.employment_status, e.profile_picture,
           u.username, u.account_status, u.must_change_password, r.role_name
@@ -390,6 +1117,7 @@ export function createAppRouter(db: ServerDatabase): Router {
       employeeName,
       email,
       mobile,
+      address,
       departmentId,
       designation,
       reportingManagerId,
@@ -410,6 +1138,7 @@ export function createAppRouter(db: ServerDatabase): Router {
     const eName = String(employeeName || '').trim();
     const eEmail = String(email || '').trim().toLowerCase();
     const eMobile = String(mobile || '').trim();
+    const eAddress = String(address || '').trim();
     const eDesignation = String(designation || '').trim();
     const eJoinDate = String(joiningDate || new Date().toISOString().slice(0, 10));
     const eUsername = String(username || '').trim();
@@ -424,6 +1153,10 @@ export function createAppRouter(db: ServerDatabase): Router {
     }
     if (ePassword !== eConfirm) {
       res.status(400).json({ error: 'Password and Confirm Password do not match.' });
+      return;
+    }
+    if (eAddress.length > 500) {
+      res.status(400).json({ error: 'Address must be 500 characters or fewer.' });
       return;
     }
 
@@ -514,10 +1247,10 @@ export function createAppRouter(db: ServerDatabase): Router {
 
       db.prepare(`
         INSERT INTO employees (
-          employee_record_id, employee_id, user_id, company_id, employee_name, email, mobile,
+          employee_record_id, employee_id, user_id, company_id, employee_name, email, mobile, address,
           department_id, designation, reporting_manager_id, hod_id, joining_date, employment_type,
           office_location_id, assigned_shift_id, employment_status, profile_picture, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         employeeRecordId,
         generatedEmployeeId,
@@ -526,6 +1259,7 @@ export function createAppRouter(db: ServerDatabase): Router {
         eName,
         eEmail,
         eMobile,
+        eAddress || null,
         departmentId || null,
         eDesignation,
         reportingManagerId || null,
@@ -587,6 +1321,7 @@ export function createAppRouter(db: ServerDatabase): Router {
           username: eUsername,
           employeeName: eName,
           email: eEmail,
+          address: eAddress || null,
           designation: eDesignation,
           role: targetRole,
           mustChangePassword: Boolean(mustChange),
@@ -605,9 +1340,9 @@ export function createAppRouter(db: ServerDatabase): Router {
 
   router.patch('/employees/:employeeRecordId', requireRoles(...ADMIN_ROLES), (req: AuthenticatedRequest, res) => {
     const existing = db
-      .prepare('SELECT employee_record_id, user_id, company_id, employee_id FROM employees WHERE employee_record_id = ?')
+      .prepare('SELECT employee_record_id, user_id, company_id, employee_id, address FROM employees WHERE employee_record_id = ?')
       .get(req.params.employeeRecordId) as
-      | { employee_record_id: string; user_id: string; company_id: string; employee_id: string }
+      | { employee_record_id: string; user_id: string; company_id: string; employee_id: string; address: string | null }
       | undefined;
 
     if (blockCrossCompanyAttempt(req, res, existing?.company_id, 'employee', req.params.employeeRecordId)) return;
@@ -616,6 +1351,7 @@ export function createAppRouter(db: ServerDatabase): Router {
       employeeName,
       email,
       mobile,
+      address,
       departmentId,
       designation,
       reportingManagerId,
@@ -627,6 +1363,11 @@ export function createAppRouter(db: ServerDatabase): Router {
       roleName,
     } = req.body || {};
 
+    if (address !== undefined && String(address).trim().length > 500) {
+      res.status(400).json({ error: 'Address must be 500 characters or fewer.' });
+      return;
+    }
+
     db.exec('BEGIN IMMEDIATE;');
     try {
       db.prepare(`
@@ -634,6 +1375,7 @@ export function createAppRouter(db: ServerDatabase): Router {
         SET employee_name = COALESCE(?, employee_name),
             email = COALESCE(?, email),
             mobile = COALESCE(?, mobile),
+            address = ?,
             department_id = COALESCE(?, department_id),
             designation = COALESCE(?, designation),
             reporting_manager_id = ?,
@@ -647,6 +1389,7 @@ export function createAppRouter(db: ServerDatabase): Router {
         employeeName ? String(employeeName).trim() : null,
         email ? String(email).trim().toLowerCase() : null,
         mobile ? String(mobile).trim() : null,
+        address === undefined ? existing?.address ?? null : String(address).trim() || null,
         departmentId || null,
         designation ? String(designation).trim() : null,
         reportingManagerId ?? null,
@@ -776,7 +1519,10 @@ export function createAppRouter(db: ServerDatabase): Router {
     }
 
     sql += ' ORDER BY a.attendance_date DESC, a.check_in_time DESC';
-    const records = db.prepare(sql).all(...params);
+    const records = (db.prepare(sql).all(...params) as Array<Record<string, unknown>>).map((record) => ({
+      ...record,
+      break_events: breakEventsFor(companyId, String(record.attendance_id)),
+    }));
 
     let assignedLocation = null;
     let assignedShift = null;
@@ -795,6 +1541,10 @@ export function createAppRouter(db: ServerDatabase): Router {
         assignedShift = db
           .prepare('SELECT * FROM shifts WHERE shift_id = ? AND company_id = ?')
           .get(emp.assigned_shift_id, companyId);
+      }
+      const effective = resolveAttendanceShift(db, companyId, req.auth!.employeeRecordId, new Date());
+      if (effective.shift) {
+        assignedShift = effective.shift;
       }
     }
     if (!assignedLocation) {
@@ -826,23 +1576,20 @@ export function createAppRouter(db: ServerDatabase): Router {
 
     const emp = db
       .prepare(`
-        SELECT e.*, l.latitude AS loc_lat, l.longitude AS loc_lng, l.radius_meters, l.name AS loc_name,
-               s.start_time, s.grace_minutes, s.shift_id
+        SELECT e.employee_record_id, e.assigned_shift_id,
+               l.latitude AS loc_lat, l.longitude AS loc_lng, l.radius_meters, l.name AS loc_name
         FROM employees e
         LEFT JOIN office_locations l ON l.location_id = e.office_location_id
-        LEFT JOIN shifts s ON s.shift_id = e.assigned_shift_id
         WHERE e.employee_record_id = ? AND e.company_id = ?
       `)
       .get(req.auth!.employeeRecordId, companyId) as
       | {
           employee_record_id: string;
+          assigned_shift_id: string | null;
           loc_lat: number | null;
           loc_lng: number | null;
           radius_meters: number | null;
           loc_name: string | null;
-          start_time: string | null;
-          grace_minutes: number | null;
-          shift_id: string | null;
         }
       | undefined;
 
@@ -886,21 +1633,22 @@ export function createAppRouter(db: ServerDatabase): Router {
     }
 
     const now = new Date();
-    const today = now.toISOString().slice(0, 10);
+    const resolved = resolveAttendanceShift(db, companyId, emp.employee_record_id, now);
+    const today = resolved.attendanceDate;
+    const effectiveShift = resolved.shift;
+    const breakConfig = resolveBreakConfig(db, companyId, emp.employee_record_id, today);
     const existing = db
       .prepare('SELECT attendance_id FROM attendance_records WHERE employee_record_id = ? AND attendance_date = ?')
       .get(emp.employee_record_id, today);
 
     if (existing) {
-      res.status(409).json({ error: 'You have already checked in today.' });
+      res.status(409).json({ error: 'You have already checked in for this shift date.' });
       return;
     }
 
-    // Late arrival detection against shift start_time + grace
-    const shiftStart = emp.start_time || '09:00';
-    const grace = emp.grace_minutes ?? settings?.grace_period_minutes ?? 15;
-    const [sh, sm] = shiftStart.split(':').map(Number);
-    const shiftMinutes = sh * 60 + sm;
+    const shiftStart = effectiveShift?.start_time || '09:00';
+    const grace = effectiveShift?.grace_minutes ?? settings?.grace_period_minutes ?? 15;
+    const shiftMinutes = parseTimeToMinutes(shiftStart, 540);
     const currentMinutes = now.getHours() * 60 + now.getMinutes();
     const diff = currentMinutes - shiftMinutes;
     const isLate = diff > grace ? 1 : 0;
@@ -913,14 +1661,16 @@ export function createAppRouter(db: ServerDatabase): Router {
       INSERT INTO attendance_records (
         attendance_id, company_id, employee_record_id, attendance_date, shift_id,
         check_in_time, check_in_lat, check_in_lng, distance_meters, geofence_status,
-        break_minutes, working_hours, is_late, late_minutes, is_half_day, status, notes
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 0, ?, ?)
+        break_minutes, working_hours, is_late, late_minutes, is_half_day, status, notes,
+        effective_shift_date, expected_working_hours, shift_start_time, shift_end_time,
+        break_policy_type, break_compliance, break_completed_minutes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 0)
     `).run(
       attId,
       companyId,
       emp.employee_record_id,
       today,
-      emp.shift_id,
+      effectiveShift?.shift_id ?? emp.assigned_shift_id,
       nowIso,
       lat,
       lng,
@@ -929,7 +1679,13 @@ export function createAppRouter(db: ServerDatabase): Router {
       isLate,
       lateMinutes,
       isLate ? 'Late (Checked In)' : 'Checked In',
-      notes
+      notes,
+      today,
+      effectiveShift?.working_hours ?? 8,
+      effectiveShift?.start_time ?? shiftStart,
+      effectiveShift?.end_time ?? null,
+      breakConfig?.break_type ?? 'unconfigured',
+      breakConfig?.break_type === 'mandatory' ? 'pending' : 'not_applicable'
     );
 
     db.prepare(`
@@ -937,18 +1693,37 @@ export function createAppRouter(db: ServerDatabase): Router {
       VALUES (?, ?, ?, ?, 'Check-In', ?, ?, ?, ?, ?)
     `).run(generateId('gps'), companyId, emp.employee_record_id, attId, lat, lng, distance, withinGeofence, nowIso);
 
-    res.status(201).json({ attendanceId: attId, isLate: Boolean(isLate), lateMinutes, geofenceStatus });
+    res.status(201).json({
+      attendanceId: attId,
+      attendanceDate: today,
+      shiftId: effectiveShift?.shift_id ?? emp.assigned_shift_id ?? null,
+      shiftName: effectiveShift?.name ?? null,
+      shiftSource: resolved.source,
+      expectedWorkingHours: effectiveShift?.working_hours ?? 8,
+      breakPolicy: breakConfig?.break_type ?? 'unconfigured',
+      isLate: Boolean(isLate),
+      lateMinutes,
+      geofenceStatus,
+    });
   });
 
   router.post('/attendance/break', (req: AuthenticatedRequest, res) => {
     const companyId = assertCompanyContext(req, res);
     if (!companyId || !req.auth!.employeeRecordId) return;
 
-    const today = new Date().toISOString().slice(0, 10);
+    const now = new Date();
+    const resolved = resolveAttendanceShift(db, companyId, req.auth!.employeeRecordId, now);
     const rec = db
       .prepare('SELECT * FROM attendance_records WHERE company_id = ? AND employee_record_id = ? AND attendance_date = ?')
-      .get(companyId, req.auth!.employeeRecordId, today) as
-      | { attendance_id: string; check_out_time: string | null; active_break_start: string | null; break_minutes: number }
+      .get(companyId, req.auth!.employeeRecordId, resolved.attendanceDate) as
+      | {
+          attendance_id: string;
+          check_out_time: string | null;
+          active_break_start: string | null;
+          break_minutes: number;
+          break_completed_minutes: number;
+          effective_shift_date: string | null;
+        }
       | undefined;
 
     if (!rec || rec.check_out_time) {
@@ -956,35 +1731,72 @@ export function createAppRouter(db: ServerDatabase): Router {
       return;
     }
 
-    const nowIso = new Date().toISOString();
+    const config = resolveBreakConfig(db, companyId, req.auth!.employeeRecordId, rec.effective_shift_date ?? resolved.attendanceDate);
+    const nowIso = now.toISOString();
     if (!rec.active_break_start) {
-      db.prepare('UPDATE attendance_records SET active_break_start = ? WHERE attendance_id = ?').run(nowIso, rec.attendance_id);
-      res.json({ onBreak: true, breakMinutes: rec.break_minutes });
-    } else {
-      const addedMins = Math.max(1, Math.round((Date.now() - Date.parse(rec.active_break_start)) / 60000));
-      const totalBreak = rec.break_minutes + addedMins;
-      db.prepare('UPDATE attendance_records SET active_break_start = NULL, break_minutes = ? WHERE attendance_id = ?').run(
-        totalBreak,
+      db.prepare('UPDATE attendance_records SET active_break_start = ?, break_policy_type = ? WHERE attendance_id = ?').run(
+        nowIso,
+        config?.break_type ?? 'unconfigured',
         rec.attendance_id
       );
-      res.json({ onBreak: false, breakMinutes: totalBreak });
+      res.json({
+        onBreak: true,
+        breakMinutes: rec.break_minutes,
+        breakPolicy: config?.break_type ?? 'unconfigured',
+        requiredMinutes: config?.duration_minutes ?? null,
+        window: config?.window_start && config?.window_end ? `${config.window_start}-${config.window_end}` : null,
+      });
+      return;
     }
+
+    const addedMins = Math.max(1, Math.round((now.getTime() - Date.parse(rec.active_break_start)) / 60000));
+    const totalBreak = rec.break_minutes + addedMins;
+    const eventCompliance = recordBreakEvent(
+      companyId,
+      req.auth!.employeeRecordId,
+      rec.attendance_id,
+      config,
+      rec.active_break_start,
+      nowIso,
+      addedMins
+    );
+    const completedMinutes = rec.break_completed_minutes + (eventCompliance === 'completed' ? addedMins : 0);
+    const overallCompliance = evaluateOverallBreakCompliance(config, completedMinutes, eventCompliance);
+    db.prepare(`
+      UPDATE attendance_records
+      SET active_break_start = NULL, break_minutes = ?, break_policy_type = ?,
+          break_compliance = ?, break_completed_minutes = ?
+      WHERE attendance_id = ?
+    `).run(totalBreak, config?.break_type ?? 'unconfigured', overallCompliance, completedMinutes, rec.attendance_id);
+    res.json({
+      onBreak: false,
+      breakMinutes: totalBreak,
+      breakPolicy: config?.break_type ?? 'unconfigured',
+      breakCompliance: overallCompliance,
+      requiredMinutes: config?.duration_minutes ?? null,
+      events: breakEventsFor(companyId, rec.attendance_id),
+    });
   });
 
   router.post('/attendance/check-out', (req: AuthenticatedRequest, res) => {
     const companyId = assertCompanyContext(req, res);
     if (!companyId || !req.auth!.employeeRecordId) return;
 
-    const today = new Date().toISOString().slice(0, 10);
+    const now = new Date();
+    const resolved = resolveAttendanceShift(db, companyId, req.auth!.employeeRecordId, now);
     const rec = db
       .prepare('SELECT * FROM attendance_records WHERE company_id = ? AND employee_record_id = ? AND attendance_date = ?')
-      .get(companyId, req.auth!.employeeRecordId, today) as
+      .get(companyId, req.auth!.employeeRecordId, resolved.attendanceDate) as
       | {
           attendance_id: string;
           check_in_time: string;
           check_out_time: string | null;
           active_break_start: string | null;
           break_minutes: number;
+          break_completed_minutes: number;
+          break_compliance: string | null;
+          effective_shift_date: string | null;
+          expected_working_hours: number;
           is_late: number;
           check_in_lat: number;
           check_in_lng: number;
@@ -992,28 +1804,46 @@ export function createAppRouter(db: ServerDatabase): Router {
       | undefined;
 
     if (!rec) {
-      res.status(400).json({ error: 'No check-in record found for today.' });
+      res.status(400).json({ error: 'No check-in record found for this shift date.' });
       return;
     }
     if (rec.check_out_time) {
-      res.status(409).json({ error: 'You have already checked out today.' });
+      res.status(409).json({ error: 'You have already checked out for this shift date.' });
       return;
     }
 
-    const now = new Date();
+    const config = resolveBreakConfig(db, companyId, req.auth!.employeeRecordId, rec.effective_shift_date ?? resolved.attendanceDate);
     const nowIso = now.toISOString();
     let totalBreakMins = rec.break_minutes;
+    let completedMinutes = rec.break_completed_minutes;
+    let lastEventCompliance: string | null = null;
+
     if (rec.active_break_start) {
-      totalBreakMins += Math.max(1, Math.round((now.getTime() - Date.parse(rec.active_break_start)) / 60000));
+      const addedMins = Math.max(1, Math.round((now.getTime() - Date.parse(rec.active_break_start)) / 60000));
+      lastEventCompliance = recordBreakEvent(
+        companyId,
+        req.auth!.employeeRecordId,
+        rec.attendance_id,
+        config,
+        rec.active_break_start,
+        nowIso,
+        addedMins
+      );
+      totalBreakMins += addedMins;
+      if (lastEventCompliance === 'completed') completedMinutes += addedMins;
     }
 
-    const elapsedHours = Math.max(0.1, (now.getTime() - Date.parse(rec.check_in_time)) / 3600000 - totalBreakMins / 60);
-    const workingHours = Number(elapsedHours.toFixed(2));
+    const compliance = evaluateOverallBreakCompliance(config, completedMinutes, lastEventCompliance);
 
     const settings = db
-      .prepare('SELECT half_day_hours FROM company_settings WHERE company_id = ?')
-      .get(companyId) as { half_day_hours: number } | undefined;
-    const halfDayThreshold = settings?.half_day_hours ?? 4.5;
+      .prepare('SELECT half_day_hours, full_day_hours FROM company_settings WHERE company_id = ?')
+      .get(companyId) as { half_day_hours: number; full_day_hours: number } | undefined;
+    const expectedHours = Number(rec.expected_working_hours) > 0
+      ? Number(rec.expected_working_hours)
+      : Number(settings?.full_day_hours ?? 8);
+    const elapsedHours = Math.max(0.1, (now.getTime() - Date.parse(rec.check_in_time)) / 3600000 - totalBreakMins / 60);
+    const workingHours = Number(Math.min(elapsedHours, expectedHours || 8).toFixed(2));
+    const halfDayThreshold = Number(settings?.half_day_hours ?? expectedHours / 2) || expectedHours / 2;
     const isHalfDay = workingHours < halfDayThreshold ? 1 : 0;
     const finalStatus = isHalfDay ? 'Half-Day' : rec.is_late ? 'Late' : 'Present';
 
@@ -1024,16 +1854,39 @@ export function createAppRouter(db: ServerDatabase): Router {
       UPDATE attendance_records
       SET check_out_time = ?, check_out_lat = ?, check_out_lng = ?,
           active_break_start = NULL, break_minutes = ?, working_hours = ?,
-          is_half_day = ?, status = ?
+          is_half_day = ?, status = ?, break_policy_type = ?, break_compliance = ?,
+          break_completed_minutes = ?
       WHERE attendance_id = ? AND company_id = ?
-    `).run(nowIso, lat, lng, totalBreakMins, workingHours, isHalfDay, finalStatus, rec.attendance_id, companyId);
+    `).run(
+      nowIso,
+      lat,
+      lng,
+      totalBreakMins,
+      workingHours,
+      isHalfDay,
+      finalStatus,
+      config?.break_type ?? 'unconfigured',
+      compliance,
+      completedMinutes,
+      rec.attendance_id,
+      companyId
+    );
 
     db.prepare(`
       INSERT INTO gps_logs (gps_id, company_id, employee_record_id, attendance_id, event_type, latitude, longitude, distance_meters, within_geofence, recorded_at)
       VALUES (?, ?, ?, ?, 'Check-Out', ?, ?, 0, 1, ?)
     `).run(generateId('gps'), companyId, req.auth!.employeeRecordId, rec.attendance_id, lat, lng, nowIso);
 
-    res.json({ workingHours, isHalfDay: Boolean(isHalfDay), status: finalStatus });
+    res.json({
+      workingHours,
+      expectedWorkingHours: expectedHours,
+      isHalfDay: Boolean(isHalfDay),
+      status: finalStatus,
+      breakMinutes: totalBreakMins,
+      breakPolicy: config?.break_type ?? 'unconfigured',
+      breakCompliance: compliance,
+      events: breakEventsFor(companyId, rec.attendance_id),
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -1262,9 +2115,16 @@ export function createAppRouter(db: ServerDatabase): Router {
     if (status === 'Approved') {
       const checkInIso = `${reg!.attendance_date}T${reg!.requested_check_in}:00.000Z`;
       const checkOutIso = `${reg!.attendance_date}T${reg!.requested_check_out}:00.000Z`;
-      const hours = Number(
-        Math.max(0.5, (Date.parse(checkOutIso) - Date.parse(checkInIso)) / 3600000 - 1).toFixed(2)
+      const resolvedForDate = resolveShiftAssignment(
+        db,
+        reg!.company_id,
+        reg!.employee_record_id,
+        reg!.attendance_date
       );
+      const expectedHours = resolvedForDate.shift?.working_hours ?? 8;
+      const breakMinutes = resolvedForDate.shift?.break_minutes ?? 60;
+      const rawHours = (Date.parse(checkOutIso) - Date.parse(checkInIso)) / 3600000 - breakMinutes / 60;
+      const hours = Number(Math.min(Math.max(0.5, rawHours), expectedHours).toFixed(2));
       const existingAtt = db
         .prepare('SELECT attendance_id FROM attendance_records WHERE company_id = ? AND employee_record_id = ? AND attendance_date = ?')
         .get(reg!.company_id, reg!.employee_record_id, reg!.attendance_date) as { attendance_id: string } | undefined;
@@ -1272,14 +2132,43 @@ export function createAppRouter(db: ServerDatabase): Router {
       if (existingAtt) {
         db.prepare(`
           UPDATE attendance_records
-          SET check_in_time = ?, check_out_time = ?, working_hours = ?, is_late = 0, late_minutes = 0, status = 'Present', notes = 'Regularized'
+          SET check_in_time = ?, check_out_time = ?, working_hours = ?, expected_working_hours = ?,
+              effective_shift_date = ?, shift_id = ?, shift_start_time = ?, shift_end_time = ?,
+              is_late = 0, late_minutes = 0, status = 'Present', notes = 'Regularized'
           WHERE attendance_id = ?
-        `).run(checkInIso, checkOutIso, hours, existingAtt.attendance_id);
+        `).run(
+          checkInIso,
+          checkOutIso,
+          hours,
+          expectedHours,
+          reg!.attendance_date,
+          resolvedForDate.shift?.shift_id ?? null,
+          resolvedForDate.shift?.start_time ?? null,
+          resolvedForDate.shift?.end_time ?? null,
+          existingAtt.attendance_id
+        );
       } else {
         db.prepare(`
-          INSERT INTO attendance_records (attendance_id, company_id, employee_record_id, attendance_date, check_in_time, check_out_time, geofence_status, working_hours, status, notes)
-          VALUES (?, ?, ?, ?, ?, ?, 'Regularized', ?, 'Present', 'Regularized')
-        `).run(generateId('att'), reg!.company_id, reg!.employee_record_id, reg!.attendance_date, checkInIso, checkOutIso, hours);
+          INSERT INTO attendance_records (
+            attendance_id, company_id, employee_record_id, attendance_date, check_in_time, check_out_time,
+            geofence_status, working_hours, expected_working_hours, effective_shift_date, shift_id,
+            shift_start_time, shift_end_time, status, notes
+          )
+          VALUES (?, ?, ?, ?, ?, ?, 'Regularized', ?, ?, ?, ?, ?, ?, 'Present', 'Regularized')
+        `).run(
+          generateId('att'),
+          reg!.company_id,
+          reg!.employee_record_id,
+          reg!.attendance_date,
+          checkInIso,
+          checkOutIso,
+          hours,
+          expectedHours,
+          reg!.attendance_date,
+          resolvedForDate.shift?.shift_id ?? null,
+          resolvedForDate.shift?.start_time ?? null,
+          resolvedForDate.shift?.end_time ?? null
+        );
       }
     }
 
@@ -1333,11 +2222,33 @@ export function createAppRouter(db: ServerDatabase): Router {
     );
 
     if (status === 'Approved') {
+      const resolved = resolveShiftAssignment(
+        db,
+        wfh!.company_id,
+        wfh!.employee_record_id,
+        wfh!.wfh_date
+      );
+      const expectedHours = resolved.shift?.working_hours ?? 8;
       db.prepare(`
-        INSERT INTO attendance_records (attendance_id, company_id, employee_record_id, attendance_date, geofence_status, working_hours, status, notes)
-        VALUES (?, ?, ?, ?, 'Remote WFH', 8.0, 'WFH', 'Approved Work From Home')
+        INSERT INTO attendance_records (
+          attendance_id, company_id, employee_record_id, attendance_date, geofence_status,
+          working_hours, expected_working_hours, effective_shift_date, shift_id,
+          shift_start_time, shift_end_time, status, notes
+        )
+        VALUES (?, ?, ?, ?, 'Remote WFH', ?, ?, ?, ?, ?, ?, 'WFH', 'Approved Work From Home')
         ON CONFLICT (employee_record_id, attendance_date) DO NOTHING
-      `).run(generateId('att'), wfh!.company_id, wfh!.employee_record_id, wfh!.wfh_date);
+      `).run(
+        generateId('att'),
+        wfh!.company_id,
+        wfh!.employee_record_id,
+        wfh!.wfh_date,
+        expectedHours,
+        expectedHours,
+        wfh!.wfh_date,
+        resolved.shift?.shift_id ?? null,
+        resolved.shift?.start_time ?? null,
+        resolved.shift?.end_time ?? null
+      );
     }
 
     res.json({ ok: true, status });

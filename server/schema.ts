@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS shifts (
   start_time TEXT NOT NULL,
   end_time TEXT NOT NULL,
   grace_minutes INTEGER NOT NULL DEFAULT 15,
-  break_minutes INTEGER NOT NULL DEFAULT 60
+  break_minutes INTEGER NOT NULL DEFAULT 60,
+  working_hours DOUBLE PRECISION NOT NULL DEFAULT 8
 );
 
 CREATE TABLE IF NOT EXISTS employees (
@@ -270,6 +271,65 @@ CREATE TABLE IF NOT EXISTS notifications (
   is_read INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
+
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS address TEXT;
+
+ALTER TABLE shifts ADD COLUMN IF NOT EXISTS working_hours DOUBLE PRECISION NOT NULL DEFAULT 8;
+
+ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS effective_shift_date TEXT;
+ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS expected_working_hours DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS shift_start_time TEXT;
+ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS shift_end_time TEXT;
+ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS break_policy_type TEXT;
+ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS break_compliance TEXT;
+ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS break_completed_minutes INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS shift_assignments (
+  assignment_id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  scope_type TEXT NOT NULL CHECK (scope_type IN ('company', 'department', 'employee')),
+  scope_id TEXT,
+  shift_id TEXT NOT NULL REFERENCES shifts(shift_id) ON DELETE CASCADE,
+  start_date TEXT NOT NULL,
+  end_date TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (end_date >= start_date)
+);
+CREATE INDEX IF NOT EXISTS shift_assignments_scope_idx
+  ON shift_assignments (company_id, scope_type, scope_id, start_date, end_date);
+
+CREATE TABLE IF NOT EXISTS lunch_break_configs (
+  config_id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  scope_type TEXT NOT NULL CHECK (scope_type IN ('company', 'department', 'employee')),
+  scope_id TEXT,
+  break_type TEXT NOT NULL CHECK (break_type IN ('mandatory', 'optional', 'flexible')),
+  duration_minutes INTEGER NOT NULL DEFAULT 60,
+  window_start TEXT,
+  window_end TEXT,
+  max_duration_minutes INTEGER,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS lunch_break_configs_scope_idx
+  ON lunch_break_configs (company_id, scope_type, scope_id, is_active);
+
+CREATE TABLE IF NOT EXISTS attendance_breaks (
+  break_id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  attendance_id TEXT NOT NULL REFERENCES attendance_records(attendance_id) ON DELETE CASCADE,
+  employee_record_id TEXT NOT NULL REFERENCES employees(employee_record_id) ON DELETE CASCADE,
+  break_type TEXT NOT NULL CHECK (break_type IN ('mandatory', 'optional', 'flexible', 'unconfigured')),
+  break_start TEXT NOT NULL,
+  break_end TEXT NOT NULL,
+  duration_minutes INTEGER NOT NULL,
+  compliance TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS attendance_breaks_attendance_idx
+  ON attendance_breaks (company_id, attendance_id, break_start);
 `;
 
 export const MIGRATION_TABLE_ORDER = [
@@ -296,4 +356,7 @@ export const MIGRATION_TABLE_ORDER = [
   'regularization_requests',
   'wfh_requests',
   'notifications',
+  'shift_assignments',
+  'lunch_break_configs',
+  'attendance_breaks',
 ] as const;
