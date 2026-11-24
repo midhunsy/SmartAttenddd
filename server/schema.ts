@@ -330,6 +330,136 @@ CREATE TABLE IF NOT EXISTS attendance_breaks (
 );
 CREATE INDEX IF NOT EXISTS attendance_breaks_attendance_idx
   ON attendance_breaks (company_id, attendance_id, break_start);
+
+CREATE TABLE IF NOT EXISTS shift_change_requests (
+  request_id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  employee_record_id TEXT NOT NULL REFERENCES employees(employee_record_id) ON DELETE CASCADE,
+  requested_shift_id TEXT NOT NULL REFERENCES shifts(shift_id),
+  current_shift_id TEXT REFERENCES shifts(shift_id),
+  start_date TEXT NOT NULL,
+  end_date TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  submission_date TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Approved', 'Rejected')),
+  reviewed_by TEXT,
+  review_comment TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS shift_change_requests_company_status_idx ON shift_change_requests (company_id, status);
+CREATE INDEX IF NOT EXISTS shift_change_requests_company_employee_idx ON shift_change_requests (company_id, employee_record_id);
+
+CREATE TABLE IF NOT EXISTS shift_schedule_overrides (
+  override_id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  employee_record_id TEXT NOT NULL REFERENCES employees(employee_record_id) ON DELETE CASCADE,
+  shift_id TEXT NOT NULL REFERENCES shifts(shift_id),
+  start_date TEXT NOT NULL,
+  end_date TEXT NOT NULL,
+  request_id TEXT NOT NULL UNIQUE REFERENCES shift_change_requests(request_id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS shift_schedule_overrides_company_dates_idx ON shift_schedule_overrides (company_id, employee_record_id, start_date, end_date);
+
+CREATE TABLE IF NOT EXISTS expense_claims (
+  claim_id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  employee_record_id TEXT NOT NULL REFERENCES employees(employee_record_id) ON DELETE CASCADE,
+  visit_date TEXT NOT NULL,
+  location TEXT NOT NULL,
+  client TEXT NOT NULL,
+  business_purpose TEXT NOT NULL,
+  approval_status TEXT NOT NULL DEFAULT 'Pending' CHECK (approval_status IN ('Pending', 'Approved', 'Rejected', 'Needs Info')),
+  payment_status TEXT NOT NULL DEFAULT 'Unpaid' CHECK (payment_status IN ('Unpaid', 'Paid')),
+  status TEXT NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Approved', 'Rejected', 'Needs Info', 'Paid')),
+  total_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+  submitted_at TEXT NOT NULL,
+  reviewed_by TEXT,
+  review_comment TEXT,
+  reviewed_at TEXT,
+  paid_at TEXT,
+  paid_by TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS expense_claims_company_status_idx ON expense_claims (company_id, status);
+CREATE INDEX IF NOT EXISTS expense_claims_company_employee_idx ON expense_claims (company_id, employee_record_id);
+
+CREATE TABLE IF NOT EXISTS expense_items (
+  item_id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  claim_id TEXT NOT NULL REFERENCES expense_claims(claim_id) ON DELETE CASCADE,
+  category TEXT NOT NULL CHECK (category IN ('Transportation', 'Food', 'Accommodation', 'Parking', 'Other')),
+  amount DOUBLE PRECISION NOT NULL,
+  description TEXT NOT NULL,
+  receipt_file_name TEXT,
+  receipt_content_type TEXT,
+  receipt_data_url TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS expense_items_company_claim_idx ON expense_items (company_id, claim_id);
+
+CREATE TABLE IF NOT EXISTS leave_policies (
+  policy_id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  leave_type TEXT NOT NULL,
+  accrual_method TEXT NOT NULL CHECK (accrual_method IN ('Annual', 'Monthly')),
+  monthly_entitlement DOUBLE PRECISION NOT NULL DEFAULT 0,
+  annual_entitlement DOUBLE PRECISION NOT NULL DEFAULT 0,
+  credit_day INTEGER NOT NULL DEFAULT 1,
+  accrual_timing TEXT NOT NULL DEFAULT 'Start of Month',
+  eligibility TEXT NOT NULL DEFAULT 'All Employees',
+  probation_months INTEGER NOT NULL DEFAULT 0,
+  prorate_by_joining_date INTEGER NOT NULL DEFAULT 1,
+  carry_forward INTEGER NOT NULL DEFAULT 0,
+  carry_forward_cap DOUBLE PRECISION NOT NULL DEFAULT 0,
+  expiry_months INTEGER NOT NULL DEFAULT 0,
+  max_balance DOUBLE PRECISION NOT NULL DEFAULT 0,
+  fractional_support INTEGER NOT NULL DEFAULT 1,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  effective_from TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (company_id, leave_type, effective_from)
+);
+CREATE INDEX IF NOT EXISTS leave_policies_company_active_idx ON leave_policies (company_id, is_active);
+
+CREATE TABLE IF NOT EXISTS leave_policy_history (
+  history_id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  policy_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  changed_by TEXT,
+  changed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS leave_policy_history_company_policy_idx ON leave_policy_history (company_id, policy_id);
+
+CREATE TABLE IF NOT EXISTS leave_ledger (
+  ledger_id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+  employee_record_id TEXT NOT NULL REFERENCES employees(employee_record_id) ON DELETE CASCADE,
+  leave_type TEXT NOT NULL,
+  entry_type TEXT NOT NULL CHECK (entry_type IN ('Accrual', 'Annual Allocation', 'Carry Forward', 'Expiry', 'Deduction', 'Adjustment')),
+  days DOUBLE PRECISION NOT NULL,
+  balance_after DOUBLE PRECISION NOT NULL,
+  policy_id TEXT,
+  period TEXT NOT NULL,
+  effective_date TEXT NOT NULL,
+  reference_id TEXT NOT NULL,
+  description TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (company_id, employee_record_id, leave_type, reference_id)
+);
+CREATE INDEX IF NOT EXISTS leave_ledger_employee_type_period_idx ON leave_ledger (company_id, employee_record_id, leave_type, period);
+CREATE INDEX IF NOT EXISTS leave_ledger_company_type_period_idx ON leave_ledger (company_id, leave_type, period);
+
+ALTER TABLE leave_balances ADD COLUMN IF NOT EXISTS current_balance DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE leave_balances ADD COLUMN IF NOT EXISTS accrued_days DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE leave_balances ADD COLUMN IF NOT EXISTS carry_forward_days DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE leave_balances ADD COLUMN IF NOT EXISTS expired_days DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE leave_balances ADD COLUMN IF NOT EXISTS updated_at TEXT;
 `;
 
 export const MIGRATION_TABLE_ORDER = [
@@ -359,4 +489,11 @@ export const MIGRATION_TABLE_ORDER = [
   'shift_assignments',
   'lunch_break_configs',
   'attendance_breaks',
+  'shift_change_requests',
+  'shift_schedule_overrides',
+  'expense_claims',
+  'expense_items',
+  'leave_policies',
+  'leave_policy_history',
+  'leave_ledger',
 ] as const;

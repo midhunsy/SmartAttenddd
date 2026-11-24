@@ -31,6 +31,7 @@ import {
   resolveShiftAssignment,
   type BreakConfigRow,
 } from '../schedule.ts';
+import { recordLeaveDeduction } from '../services/enterpriseLeave.ts';
 
 const ADMIN_ROLES = ['Company Admin', 'HR'];
 const APPROVER_ROLES = ['Company Admin', 'HR', 'HOD', 'Manager', 'Responsible Person'];
@@ -2038,6 +2039,15 @@ export function createAppRouter(db: ServerDatabase): Router {
       `).run(req.auth!.employeeRecordId, comment, leave!.leave_id);
 
       if (leave!.is_paid === 1) {
+        recordLeaveDeduction(
+          db,
+          leave!.company_id,
+          leave!.employee_record_id,
+          leave!.leave_type,
+          leave!.days_count,
+          leave!.leave_id,
+          req.auth!.fullName || req.auth!.username
+        );
         db.prepare(`
           UPDATE leave_balances
           SET used_days = used_days + ?
