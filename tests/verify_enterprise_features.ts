@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
+import bcrypt from 'bcryptjs';
 import { createIsolatedDbForTests } from '../server/db.ts';
 import { createExpressApp } from '../server.ts';
 import { calculateAccrualDays, type LeavePolicyRow } from '../server/services/enterpriseLeave.ts';
@@ -282,6 +283,14 @@ async function runTests() {
 
       const start = addDays(today, 20);
       const end = addDays(today, 21);
+      const invalid = await req('/api/shift-change-requests', {
+        method: 'POST',
+        token: employeeAToken,
+        body: { requestedShiftId: eveningShiftId, startDate: start, endDate: end, reason: '   ' },
+      });
+      assert.equal(invalid.status, 400, JSON.stringify(invalid.data));
+      assert.equal(invalid.data.error, 'A valid shift, date range, and reason are required.');
+
       const submitted = await req('/api/shift-change-requests', {
         method: 'POST',
         token: employeeAToken,
@@ -290,6 +299,25 @@ async function runTests() {
       assert.equal(submitted.status, 201, JSON.stringify(submitted.data));
       assert.equal(submitted.data.status, 'Pending');
       requestId = submitted.data.requestId as string;
+
+      const persisted = db
+        .prepare('SELECT * FROM shift_change_requests WHERE request_id = ?')
+        .get(requestId) as Record<string, unknown> | undefined;
+      assert.ok(persisted, 'submitted shift change request must be persisted');
+      assert.equal(persisted.company_id, companyA.companyId);
+      assert.equal(persisted.employee_record_id, employeeA.employeeRecordId);
+      assert.equal(persisted.requested_shift_id, eveningShiftId);
+      assert.equal(persisted.start_date, start);
+      assert.equal(persisted.end_date, end);
+      assert.equal(persisted.reason, 'Project handover');
+      assert.equal(persisted.status, 'Pending');
+
+      const ownRequests = await req('/api/shift-change-requests', { token: employeeAToken });
+      assert.equal(ownRequests.status, 200);
+      assert.ok(
+        ownRequests.data.requests.some((row: Record<string, unknown>) => row.request_id === requestId),
+        JSON.stringify(ownRequests.data.requests)
+      );
 
       const denied = await req(`/api/shift-change-requests/${requestId}/action`, {
         method: 'POST',
@@ -305,6 +333,19 @@ async function runTests() {
       });
       assert.equal(approved.status, 200, JSON.stringify(approved.data));
       assert.equal(approved.data.status, 'Approved');
+
+      const override = db
+        .prepare('SELECT * FROM shift_schedule_overrides WHERE request_id = ?')
+        .get(requestId) as Record<string, unknown> | undefined;
+      assert.ok(override, 'approval must create a schedule override');
+      assert.equal(override.company_id, companyA.companyId);
+      assert.equal(override.employee_record_id, employeeA.employeeRecordId);
+      assert.equal(override.shift_id, eveningShiftId);
+
+      const reassigned = db
+        .prepare('SELECT assigned_shift_id FROM employees WHERE employee_record_id = ?')
+        .get(employeeA.employeeRecordId) as { assigned_shift_id: string } | undefined;
+      assert.equal(reassigned?.assigned_shift_id, eveningShiftId);
 
       const overlapping = await req('/api/shift-change-requests', {
         method: 'POST',
@@ -500,6 +541,47 @@ async function runTests() {
       const ownOverviewB = await req('/api/leave-overview', { token: employeeBToken });
       assert.equal(ownOverviewB.status, 200);
       assert.ok(ownOverviewB.data.ledger.every((row: Record<string, unknown>) => row.company_id === companyB.companyId));
+    });
+
+    await test('8. Shift change submission rejects missing employee context explicitly', async () => {
+      const userId = 'user_alpha_no_employee';
+      const username = 'ent_alpha_no_employee';
+      const now = new Date().toISOString();
+      db.prepare(
+        `INSERT INTO users
+          (user_id, username, password_hash, email, mobile, full_name, company_id, role_id, account_status, must_change_password, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?)`
+      ).run(
+        userId,
+        username,
+        bcrypt.hashSync('Password@123', 10),
+        `${username}@example.test`,
+        '+1 555-0199',
+        'No Employee Context',
+        companyA.companyId,
+        'role_employee',
+        now
+      );
+      db.prepare('INSERT INTO login_identifiers (identifier, user_id, kind, created_at) VALUES (?, ?, ?, ?)').run(
+        username,
+        userId,
+        'username',
+        now
+      );
+      const token = await login(username);
+      const response = await req('/api/shift-change-requests', {
+        method: 'POST',
+        token,
+        body: {
+          requestedShiftId: eveningShiftId,
+          startDate: addDays(today, 40),
+          endDate: addDays(today, 41),
+          reason: 'Should not submit without employee record',
+        },
+      });
+      assert.equal(response.status, 400, JSON.stringify(response.data));
+      assert.equal(response.data.error, 'Employee context is required for this module.');
+      assert.equal(response.data.code, 'EMPLOYEE_CONTEXT_REQUIRED');
     });
 
     console.log(`\nALL ${passed} ENTERPRISE INTEGRATION TESTS PASSED SUCCESSFULLY.`);

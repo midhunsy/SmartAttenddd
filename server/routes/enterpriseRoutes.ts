@@ -390,7 +390,14 @@ export function createEnterpriseRoutes(db: ServerDatabase): Router {
 
   router.post('/shift-change-requests', (req: AuthenticatedRequest, res) => {
     const companyId = assertCompanyContext(req, res);
-    if (!companyId || !req.auth?.employeeRecordId) return;
+    if (!companyId) return;
+    if (!req.auth?.employeeRecordId) {
+      res.status(400).json({
+        error: 'Employee context is required for this module.',
+        code: 'EMPLOYEE_CONTEXT_REQUIRED',
+      });
+      return;
+    }
 
     const { requestedShiftId, startDate, endDate, reason } = req.body || {};
     const start = isoDate(startDate);

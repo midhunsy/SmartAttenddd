@@ -32,6 +32,9 @@ export function createExpressApp(db: ServerDatabase) {
   app.use('/api/auth', createAuthRouter(db));
   app.use('/api', createAppRouter(db));
   app.use('/api', createEnterpriseRoutes(db));
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
 
   return app;
 }

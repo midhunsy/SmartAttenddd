@@ -13,7 +13,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx tests/enterprise_unit.ts && tsx tests/schedule_logic_test.ts && tsx tests/verify_smartattend.ts && tsx tests/verify_enterprise_features.ts",
+    "test": "tsx tests/enterprise_unit.ts && tsx tests/schedule_logic_test.ts && tsx tests/api_404_test.ts && tsx tests/verify_smartattend.ts && tsx tests/verify_enterprise_features.ts",
     "test:unit": "tsx tests/schedule_logic_test.ts",
     "test:enterprise": "tsx tests/enterprise_unit.ts",
     "migrate:sqlite": "tsx scripts/migrate-sqlite-to-postgres.ts"
